@@ -8,7 +8,6 @@ URL_EDT = "https://edt.enise.fr/invite"
 NOM_ETUDIANT = "VIVIER"  # Passe à "VIVIER Nolann" si plusieurs homonymes apparaissent
 HEADLESS = True
 DEPUIS_DEBUT_ANNEE = True  # True = de septembre à juillet | False = d'aujourd'hui à juillet
-MAX_SEMAINES = 48
 
 
 MOIS_FR = {
@@ -118,7 +117,6 @@ def annee_pour_mois(mois: int, maintenant: datetime) -> int:
 def extraire_date_depuis_texte(texte: str, maintenant: datetime) -> datetime | None:
     texte_propre = re.sub(r"\(\s*\d+\s*/\s*\d+\s*\)", "", texte)
 
-    # 1. Format "23 nov." ou "23 novembre"
     m_fr = re.search(r"\b(\d{1,2})\s+([a-zàâäéèêëîïôöùûüç]{3,10})\.?\b", texte_propre, re.IGNORECASE)
     if m_fr:
         jour = int(m_fr.group(1))
@@ -130,7 +128,6 @@ def extraire_date_depuis_texte(texte: str, maintenant: datetime) -> datetime | N
             except ValueError:
                 pass
 
-    # 2. Format numérique "23/11" ou "23/11/2026"
     m_num = re.search(r"\b(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?\b", texte_propre)
     if m_num:
         jour, mois = int(m_num.group(1)), int(m_num.group(2))
@@ -145,7 +142,6 @@ def extraire_date_depuis_texte(texte: str, maintenant: datetime) -> datetime | N
         except ValueError:
             pass
 
-    # 3. Nom du jour seul ("lun.", "lundi") rattaché à la semaine en cours
     m_jour = re.search(r"\b(lun|mar|mer|jeu|ven|sam|dim)[a-z]*\.?\b", texte_propre, re.IGNORECASE)
     if m_jour:
         idx_jour = JOURS_FR[m_jour.group(1).lower()]
@@ -174,16 +170,16 @@ def reperer_colonnes_jours(page, maintenant: datetime) -> list[dict]:
                     "date": date_col,
                     "label": txt,
                 })
+    colonnes_jours.sort(key=lambda c: c["x_centre"])
     return colonnes_jours
 
 
 def signature_semaine(colonnes_jours: list[dict]) -> str:
-    return "|".join(sorted(c["label"] for c in colonnes_jours))
+    return "|".join(c["label"] for c in colonnes_jours)
 
 
-def attendre_changement_semaine(page, signature_avant: str, maintenant: datetime, timeout_ms: int = 3000) -> bool:
-    """Attend dynamiquement que les en-têtes de colonnes changent après un clic de navigation."""
-    pas_ms = 200
+def attendre_changement_semaine(page, signature_avant: str, maintenant: datetime, timeout_ms: int = 1800) -> bool:
+    pas_ms = 150
     for _ in range(timeout_ms // pas_ms):
         page.wait_for_timeout(pas_ms)
         cols = reperer_colonnes_jours(page, maintenant)
@@ -195,7 +191,6 @@ def attendre_changement_semaine(page, signature_avant: str, maintenant: datetime
 
 
 def formater_lieu(infos_cours: list[str]) -> str:
-    """Extrait proprement les numéros de salle (ex. 250, 229 INFO) et l'adresse sans doublon."""
     salles = []
     adresse = ""
 
@@ -203,7 +198,6 @@ def formater_lieu(infos_cours: list[str]) -> str:
         if re.search(r"\b(rue|avenue|boulevard|allée|place|impasse|jean parot)\b", ligne, re.I):
             adresse = ligne
             continue
-        # Ignore les codes de groupe (2GX-CMTD1, 2GM-TP4...) et les types de séance (CM, TD, TP...)
         if re.match(r"^\d+[A-Z]{2,}-", ligne, re.I) or re.match(r"^(CM|TD|TP|CMTD|DS)\b", ligne, re.I):
             continue
         if re.match(
@@ -294,62 +288,81 @@ def extraire_cours_visibles(page, maintenant: datetime) -> tuple[list[dict], str
     return evenements, sig
 
 
-def cliquer_fleche_semaine(page, direction: str, signature_avant: str, maintenant: datetime) -> bool:
-    """Navigue d'une semaine ('suivante' ou 'precedente') et vérifie le rafraîchissement de la grille."""
-    if direction == "suivante":
-        candidats = [
-            page.locator("[title*='suivante' i]:visible, [aria-label*='suivante' i]:visible").first,
-            page.locator("[class*='fleche_droite']:visible, [class*='droite']:visible, [class*='next']:visible, [class*='suivant']:visible").first,
-            page.locator(
-                "[class*='Calendrier_Jour_Selection']:visible, [class*='semaine'][class*='actif']:visible, [aria-selected='true']:visible"
-            ).first.locator("xpath=following-sibling::*[1]"),
-        ]
-    else:
-        candidats = [
-            page.locator("[title*='précédente' i]:visible, [title*='precedente' i]:visible, [aria-label*='précédente' i]:visible").first,
-            page.locator("[class*='fleche_gauche']:visible, [class*='gauche']:visible, [class*='prev']:visible, [class*='precedent']:visible").first,
-            page.locator(
-                "[class*='Calendrier_Jour_Selection']:visible, [class*='semaine'][class*='actif']:visible, [aria-selected='true']:visible"
-            ).first.locator("xpath=preceding-sibling::*[1]"),
-        ]
-
-    for btn in candidats:
+def trouver_barre_semaines(page) -> tuple[list[dict], float | None]:
+    """Repère la ligne horizontale unique contenant les pastilles de semaines (1..53)."""
+    candidats = page.locator("div:visible, td:visible, span:visible, li:visible, a:visible, button:visible").all()
+    items = []
+    for el in candidats:
         try:
-            if btn.count() > 0:
-                btn.click(timeout=2000)
-                if attendre_changement_semaine(page, signature_avant, maintenant):
-                    return True
+            txt = el.inner_text().strip()
+            if not re.fullmatch(r"\d{1,2}", txt):
+                continue
+            num = int(txt)
+            if not (1 <= num <= 53):
+                continue
+            box = el.bounding_box()
+            if not box or box["y"] > 300 or box["width"] > 80 or box["height"] > 60:
+                continue
+            items.append({
+                "el": el,
+                "num": num,
+                "x": box["x"] + box["width"] / 2,
+                "y": box["y"] + box["height"] / 2,
+            })
         except Exception:
             continue
 
+    if not items:
+        return [], None
+
+    meilleure_bande = []
+    for ref in items:
+        bande = [it for it in items if abs(it["y"] - ref["y"]) <= 10]
+        bande.sort(key=lambda it: it["x"])
+        bande_unique = []
+        for it in bande:
+            if not bande_unique or abs(it["x"] - bande_unique[-1]["x"]) > 8:
+                bande_unique.append(it)
+        if len(bande_unique) > len(meilleure_bande):
+            meilleure_bande = bande_unique
+
+    if len(meilleure_bande) < 5:
+        return [], None
+
+    y_moyen = sum(it["y"] for it in meilleure_bande) / len(meilleure_bande)
+    return meilleure_bande, y_moyen
+
+
+def cliquer_fleche_barre(page, y_barre: float, cote: str, x_limite: float) -> bool:
+    """Clique sur la flèche de défilement gauche ou droite située sur l'axe Y de la barre des semaines."""
+    candidats = page.locator("div:visible, td:visible, span:visible, button:visible, i:visible, a:visible").all()
+    meilleur = None
+    for el in candidats:
+        try:
+            box = el.bounding_box()
+            if not box or box["width"] > 60 or box["height"] > 60:
+                continue
+            yc = box["y"] + box["height"] / 2
+            xc = box["x"] + box["width"] / 2
+            if abs(yc - y_barre) > 15:
+                continue
+            if cote == "gauche" and xc < x_limite - 5:
+                if meilleur is None or xc > meilleur[0]:
+                    meilleur = (xc, el)
+            elif cote == "droite" and xc > x_limite + 5:
+                if meilleur is None or xc < meilleur[0]:
+                    meilleur = (xc, el)
+        except Exception:
+            continue
+
+    if meilleur:
+        try:
+            meilleur[1].click(timeout=1500)
+            page.wait_for_timeout(400)
+            return True
+        except Exception:
+            return False
     return False
-
-
-def aller_debut_annee(page, maintenant: datetime):
-    """Revient à la première semaine de l'année universitaire (septembre) avant le balayage complet."""
-    print("Retour au début de l'année universitaire...")
-    # 1. Tentative de clic direct sur la première pastille de semaine dans le bandeau supérieur
-    pastilles_semaines = page.locator(
-        "[class*='Calendrier_Jour']:visible, [class*='Calendrier'] td:visible, [class*='Calendrier'] div[role='button']:visible"
-    ).all()
-    for p in pastilles_semaines:
-        txt = p.inner_text().strip()
-        box = p.bounding_box()
-        if re.fullmatch(r"\d{1,2}", txt) and box and box["y"] < 260:
-            sig_avant = signature_semaine(reperer_colonnes_jours(page, maintenant))
-            try:
-                p.click(timeout=2000)
-                if attendre_changement_semaine(page, sig_avant, maintenant):
-                    return
-            except Exception:
-                pass
-            break
-
-    # 2. Repli : recul semaine par semaine jusqu'au début disponible
-    for _ in range(25):
-        sig_avant = signature_semaine(reperer_colonnes_jours(page, maintenant))
-        if not cliquer_fleche_semaine(page, "precedente", sig_avant, maintenant):
-            break
 
 
 def recuperer_edt():
@@ -391,28 +404,70 @@ def recuperer_edt():
         page.wait_for_timeout(3500)
         maintenant = datetime.now()
 
-        if DEPUIS_DEBUT_ANNEE:
-            aller_debut_annee(page, maintenant)
-
         evenements_uniques = []
         cles_vues = set()
+        semaines_traitees = set()
 
-        for idx_semaine in range(MAX_SEMAINES):
-            cours_semaine, sig = extraire_cours_visibles(page, maintenant)
+        bande, y_barre = trouver_barre_semaines(page)
+        print(f"Barre des semaines détectée : {[b['num'] for b in bande]}")
 
-            ajoutes_semaine = 0
-            for ev in cours_semaine:
-                cle = (ev["dtstart"], ev["dtend"], ev["summary"])
-                if cle not in cles_vues:
-                    cles_vues.add(cle)
-                    evenements_uniques.append(ev)
-                    ajoutes_semaine += 1
+        if bande and y_barre is not None:
+            if DEPUIS_DEBUT_ANNEE:
+                # Défile tout à gauche jusqu'à septembre puis sélectionne la première semaine
+                for _ in range(10):
+                    premier_avant = bande[0]["num"]
+                    if not cliquer_fleche_barre(page, y_barre, "gauche", bande[0]["x"]):
+                        break
+                    bande, y_barre = trouver_barre_semaines(page)
+                    if not bande or bande[0]["num"] == premier_avant:
+                        break
 
-            print(f"Semaine {idx_semaine + 1} ({sig.split('|')[0] if sig else '?'}) : {ajoutes_semaine} cours.")
+                sig_avant = signature_semaine(reperer_colonnes_jours(page, maintenant))
+                bande[0]["el"].click(timeout=2000)
+                attendre_changement_semaine(page, sig_avant, maintenant)
+                semaines_traitees.add(bande[0]["num"])
+            else:
+                sem_actuelle = maintenant.isocalendar().week
+                for b in bande:
+                    if b["num"] == sem_actuelle:
+                        break
+                    semaines_traitees.add(b["num"])
+                semaines_traitees.add(sem_actuelle)
 
-            if not cliquer_fleche_semaine(page, "suivante", sig, maintenant):
-                print("Fin de l'année universitaire atteinte.")
-                break
+            for _ in range(52):
+                cours_semaine, sig = extraire_cours_visibles(page, maintenant)
+                ajoutes = 0
+                for ev in cours_semaine:
+                    cle = (ev["dtstart"], ev["dtend"], ev["summary"])
+                    if cle not in cles_vues:
+                        cles_vues.add(cle)
+                        evenements_uniques.append(ev)
+                        ajoutes += 1
+
+                lundi_txt = sig.split("|")[0] if sig else "?"
+                print(f"Semaine ({lundi_txt}) : {ajoutes} cours.")
+
+                bande, y_barre = trouver_barre_semaines(page)
+                if not bande or y_barre is None:
+                    break
+
+                prochaine = next((b for b in bande if b["num"] not in semaines_traitees), None)
+                if prochaine is None:
+                    if cliquer_fleche_barre(page, y_barre, "droite", bande[-1]["x"]):
+                        bande, y_barre = trouver_barre_semaines(page)
+                        prochaine = next((b for b in bande if b["num"] not in semaines_traitees), None)
+
+                if prochaine is None:
+                    print("Fin de la barre des semaines atteinte.")
+                    break
+
+                semaines_traitees.add(prochaine["num"])
+                prochaine["el"].click(timeout=2000)
+                attendre_changement_semaine(page, sig, maintenant)
+        else:
+            # Repli de sécurité : extrait au minimum la semaine courante affichée
+            cours_semaine, _ = extraire_cours_visibles(page, maintenant)
+            evenements_uniques.extend(cours_semaine)
 
         browser.close()
 
