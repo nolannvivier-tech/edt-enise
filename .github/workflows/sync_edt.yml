@@ -6,6 +6,10 @@ on:
     - cron: "0 6-22/2 * * 1-6"
   workflow_dispatch:
 
+concurrency:
+  group: sync-edt
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -36,5 +40,6 @@ jobs:
           git add edt_enise.ics
           if ! git diff --staged --quiet; then
             git commit -m "Mise à jour EDT"
+            git pull --rebase -X ours origin main
             git push
           fi
