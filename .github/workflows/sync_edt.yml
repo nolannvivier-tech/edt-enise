@@ -1,0 +1,40 @@
+name: Synchronisation EDT ENISE
+
+on:
+  schedule:
+    # Exécution toutes les 2 heures de 6h à 22h UTC, du lundi au samedi
+    - cron: "0 6-22/2 * * 1-6"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-ics:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installation de Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installation de Playwright et Chromium
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Extraction de l'emploi du temps
+        run: python edt.py
+
+      - name: Mise à jour du fichier .ics si modifié
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add edt_enise.ics
+          if ! git diff --staged --quiet; then
+            git commit -m "Mise à jour EDT"
+            git push
+          fi
