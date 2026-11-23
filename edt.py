@@ -199,14 +199,14 @@ def signature_semaine(colonnes_jours: list[dict]) -> str:
     return "|".join(c["label"] for c in colonnes_jours)
 
 
-def attendre_changement_semaine(page, signature_avant: str, maintenant: datetime, timeout_ms: int = 2500) -> bool:
+def attendre_changement_semaine(page, signature_avant: str, maintenant: datetime, timeout_ms: int = 3500) -> bool:
     pas_ms = 150
     for _ in range(timeout_ms // pas_ms):
         page.wait_for_timeout(pas_ms)
         cols = reperer_colonnes_jours(page, maintenant)
         sig = signature_semaine(cols)
         if sig and sig != signature_avant:
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(300)
             return True
     return False
 
@@ -251,6 +251,7 @@ def extraire_cours_visibles(page, maintenant: datetime) -> tuple[list[dict], str
                 "[class*='cours']",
                 "[class*='slot']"
             ];
+            const timeRegex = /(?:de\s+)?\d{1,2}[h:]\d{2}\s*(?:-|–|—|à|\/)\s*\d{1,2}[h:]\d{2}/;
             for (const sel of selecteurs) {
                 const els = Array.from(document.querySelectorAll(sel));
                 if (els.length === 0) continue;
@@ -261,6 +262,8 @@ def extraire_cours_visibles(page, maintenant: datetime) -> tuple[list[dict], str
                     const texte = (el.innerText || '').trim();
                     if (!texte) continue;
                     const aria = el.getAttribute('aria-label') || el.getAttribute('title') || '';
+                    const sourceComplete = `${aria} | ${texte}`;
+                    if (!timeRegex.test(sourceComplete)) continue;
                     items.push({
                         texte: texte,
                         aria: aria,
