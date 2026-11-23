@@ -8,6 +8,31 @@ URL_EDT = "https://edt.enise.fr/invite"
 NOM_ETUDIANT = "VIVIER"  # Passe à "VIVIER Nolann" si plusieurs homonymes apparaissent
 HEADLESS = True
 
+MOIS_FR = {
+    "janv": 1, "jan": 1,
+    "févr": 2, "fevr": 2, "fév": 2, "fev": 2,
+    "mars": 3, "mar": 3,
+    "avr": 4,
+    "mai": 5,
+    "juin": 6,
+    "juil": 7,
+    "août": 8, "aout": 8,
+    "sept": 9, "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "déc": 12, "dec": 12,
+}
+
+JOURS_FR = {
+    "lun": 0,
+    "mar": 1,
+    "mer": 2,
+    "jeu": 3,
+    "ven": 4,
+    "sam": 5,
+    "dim": 6,
+}
+
 
 def paris_vers_utc(dt_local: datetime) -> datetime:
     """Convertit une heure locale française en UTC (gestion heure d'été/hiver)."""
@@ -81,18 +106,49 @@ def generer_ics(evenements: list[dict], chemin_sortie: str = "edt_enise.ics") ->
     return nb_ajoutes
 
 
-def extraire_date_depuis_texte(texte: str, annee_defaut: int) -> datetime | None:
-    m = re.search(r"\b(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?\b", texte)
-    if not m:
-        return None
-    jour, mois = int(m.group(1)), int(m.group(2))
-    annee = int(m.group(3)) if m.group(3) else annee_defaut
-    if annee < 100:
-        annee += 2000
-    try:
-        return datetime(annee, mois, jour)
-    except ValueError:
-        return None
+def extraire_date_depuis_texte(texte: str, maintenant: datetime) -> datetime | None:
+    # Ignore les mentions de séance type "(2/3)" pour ne pas les confondre avec une date
+    texte_propre = re.sub(r"\(\s*\d+\s*/\s*\d+\s*\)", "", texte)
+
+    # 1. Format "23 nov." ou "23 novembre"
+    m_fr = re.search(r"\b(\d{1,2})\s+([a-zàâäéèêëîïôöùûüç]{3,10})\.?\b", texte_propre, re.IGNORECASE)
+    if m_fr:
+        jour = int(m_fr.group(1))
+        mois_txt = m_fr.group(2).lower()
+        mois = MOIS_FR.get(mois_txt[:4]) or MOIS_FR.get(mois_txt[:3])
+        if mois:
+            annee = maintenant.year
+            if maintenant.month == 12 and mois == 1:
+                annee += 1
+            elif maintenant.month == 1 and mois == 12:
+                annee -= 1
+            try:
+                return datetime(annee, mois, jour)
+            except ValueError:
+                pass
+
+    # 2. Format numérique "23/11" ou "23/11/2026"
+    m_num = re.search(r"\b(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?\b", texte_propre)
+    if m_num:
+        jour, mois = int(m_num.group(1)), int(m_num.group(2))
+        annee = int(m_num.group(3)) if m_num.group(3) else maintenant.year
+        if annee < 100:
+            annee += 2000
+        try:
+            return datetime(annee, mois, jour)
+        except ValueError:
+            pass
+
+    # 3. Nom du jour seul ("lun.", "lundi", etc.) rattaché à la semaine en cours
+    m_jour = re.search(r"\b(lun|mar|mer|jeu|ven|sam|dim)[a-z]*\.?\b", texte_propre, re.IGNORECASE)
+    if m_jour:
+        idx_jour = JOURS_FR[m_jour.group(1).lower()]
+        lundi_semaine = datetime(maintenant.year, maintenant.month, maintenant.day) - timedelta(
+            days=maintenant.weekday()
+        )
+        return lundi_semaine + timedelta(days=idx_jour)
+
+    return None
 
 
 def recuperer_edt():
@@ -132,19 +188,20 @@ def recuperer_edt():
             search_input.press("Enter")
 
         page.wait_for_timeout(4000)
-        annee_courante = datetime.now().year
+        maintenant = datetime.now()
 
+        # Repérage des colonnes des jours ("lun. 23 nov.", "Lundi 23", etc.)
         colonnes_jours = []
-        candidats_entetes = page.locator("th:visible, div:visible, span:visible").filter(
-            has_text=re.compile(r"(lun|mar|mer|jeu|ven|sam)[^\d]*\d{1,2}[/.-]\d{1,2}", re.IGNORECASE)
+        candidats_entetes = page.locator("th:visible, div:visible, span:visible, td:visible").filter(
+            has_text=re.compile(r"\b(lun|mar|mer|jeu|ven|sam)[a-z]*\.?\b", re.IGNORECASE)
         ).all()
 
         for entete in candidats_entetes:
             txt = entete.inner_text().strip()
-            if len(txt) <= 30:
-                date_col = extraire_date_depuis_texte(txt, annee_courante)
+            if len(txt) <= 30 and not re.search(r"\d{1,2}[h:]\d{2}", txt):
+                date_col = extraire_date_depuis_texte(txt, maintenant)
                 box = entete.bounding_box()
-                if date_col and box:
+                if date_col and box and box["width"] > 30:
                     colonnes_jours.append({"x_centre": box["x"] + box["width"] / 2, "date": date_col})
 
         selecteurs_possibles = [
@@ -172,7 +229,7 @@ def recuperer_edt():
                     continue
 
                 m_heure = re.search(
-                    r"(?:de\s+)?(\d{1,2})[h:](\d{2})\s*(?:-|–|—|à)\s*(\d{1,2})[h:](\d{2})",
+                    r"(?:de\s+)?(\d{1,2})[h:](\d{2})\s*(?:-|–|—|à|/)\s*(\d{1,2})[h:](\d{2})",
                     source_complete,
                 )
                 if not m_heure:
@@ -180,13 +237,17 @@ def recuperer_edt():
 
                 h1, min1, h2, min2 = map(int, m_heure.groups())
 
-                date_cours = extraire_date_depuis_texte(source_complete, annee_courante)
-                if not date_cours and colonnes_jours:
+                # Priorité à l'alignement horizontal avec la colonne du jour
+                date_cours = None
+                if colonnes_jours:
                     box = el.bounding_box()
                     if box:
                         x_cours = box["x"] + box["width"] / 2
                         col_proche = min(colonnes_jours, key=lambda c: abs(c["x_centre"] - x_cours))
                         date_cours = col_proche["date"]
+
+                if not date_cours:
+                    date_cours = extraire_date_depuis_texte(aria or texte, maintenant)
 
                 if not date_cours:
                     continue
@@ -197,13 +258,22 @@ def recuperer_edt():
                     if not re.search(r"^\d{1,2}[h:]\d{2}\s*(?:-|–|—|à)\s*\d{1,2}[h:]\d{2}$", l)
                 ]
                 titre = infos_cours[0] if infos_cours else "Cours ENISE"
-                salle = next((l for l in infos_cours[1:] if re.search(r"salle|amphi|labo|^[A-Z]\d+", l, re.I)), "")
+
+                salle = next(
+                    (l for l in infos_cours[1:] if re.search(r"^\d{2,4}\s+[A-Z]|salle|amphi|labo|atelier|^[A-Z]\d+", l, re.I)),
+                    "",
+                )
+                adresse = next(
+                    (l for l in infos_cours[1:] if re.search(r"\b(rue|avenue|boulevard|allée|place|impasse)\b", l, re.I)),
+                    "",
+                )
+                lieu = " - ".join(part for part in (salle, adresse) if part)
 
                 evenements_ics.append({
                     "dtstart": date_cours.replace(hour=h1, minute=min1),
                     "dtend": date_cours.replace(hour=h2, minute=min2),
                     "summary": titre,
-                    "location": salle,
+                    "location": lieu,
                     "description": " | ".join(lignes_texte),
                 })
 
