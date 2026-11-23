@@ -7,7 +7,8 @@ from playwright.sync_api import sync_playwright
 URL_EDT = "https://edt.enise.fr/invite"
 NOM_ETUDIANT = "VIVIER"  # Passe à "VIVIER Nolann" si plusieurs homonymes apparaissent
 HEADLESS = True
-NB_SEMAINES = 4  # Semaine en cours + 3 semaines suivantes
+DEPUIS_DEBUT_ANNEE = True  # True = de septembre à juillet | False = d'aujourd'hui à juillet
+MAX_SEMAINES = 48
 
 
 MOIS_FR = {
@@ -108,7 +109,13 @@ def generer_ics(evenements: list[dict], chemin_sortie: str = "edt_enise.ics") ->
     return nb_ajoutes
 
 
-def extraire_date_depuis_texte(texte: str, date_ref: datetime) -> datetime | None:
+def annee_pour_mois(mois: int, maintenant: datetime) -> int:
+    """Déduit l'année civile exacte d'un mois au sein de l'année universitaire (août -> juillet)."""
+    annee_rentree = maintenant.year if maintenant.month >= 8 else maintenant.year - 1
+    return annee_rentree if mois >= 8 else annee_rentree + 1
+
+
+def extraire_date_depuis_texte(texte: str, maintenant: datetime) -> datetime | None:
     texte_propre = re.sub(r"\(\s*\d+\s*/\s*\d+\s*\)", "", texte)
 
     # 1. Format "23 nov." ou "23 novembre"
@@ -118,13 +125,8 @@ def extraire_date_depuis_texte(texte: str, date_ref: datetime) -> datetime | Non
         mois_txt = m_fr.group(2).lower()
         mois = MOIS_FR.get(mois_txt[:4]) or MOIS_FR.get(mois_txt[:3])
         if mois:
-            annee = date_ref.year
-            if date_ref.month >= 11 and mois <= 2:
-                annee += 1
-            elif date_ref.month <= 2 and mois >= 11:
-                annee -= 1
             try:
-                return datetime(annee, mois, jour)
+                return datetime(annee_pour_mois(mois, maintenant), mois, jour)
             except ValueError:
                 pass
 
@@ -132,27 +134,30 @@ def extraire_date_depuis_texte(texte: str, date_ref: datetime) -> datetime | Non
     m_num = re.search(r"\b(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?\b", texte_propre)
     if m_num:
         jour, mois = int(m_num.group(1)), int(m_num.group(2))
-        annee = int(m_num.group(3)) if m_num.group(3) else date_ref.year
-        if annee < 100:
-            annee += 2000
+        if m_num.group(3):
+            annee = int(m_num.group(3))
+            if annee < 100:
+                annee += 2000
+        else:
+            annee = annee_pour_mois(mois, maintenant)
         try:
             return datetime(annee, mois, jour)
         except ValueError:
             pass
 
-    # 3. Nom du jour seul ("lun.", "lundi") rattaché à la semaine de référence
+    # 3. Nom du jour seul ("lun.", "lundi") rattaché à la semaine en cours
     m_jour = re.search(r"\b(lun|mar|mer|jeu|ven|sam|dim)[a-z]*\.?\b", texte_propre, re.IGNORECASE)
     if m_jour:
         idx_jour = JOURS_FR[m_jour.group(1).lower()]
-        lundi_semaine = datetime(date_ref.year, date_ref.month, date_ref.day) - timedelta(
-            days=date_ref.weekday()
+        lundi_semaine = datetime(maintenant.year, maintenant.month, maintenant.day) - timedelta(
+            days=maintenant.weekday()
         )
         return lundi_semaine + timedelta(days=idx_jour)
 
     return None
 
 
-def reperer_colonnes_jours(page, date_ref: datetime) -> list[dict]:
+def reperer_colonnes_jours(page, maintenant: datetime) -> list[dict]:
     colonnes_jours = []
     candidats_entetes = page.locator("th:visible, div:visible, span:visible, td:visible").filter(
         has_text=re.compile(r"\b(lun|mar|mer|jeu|ven|sam)[a-z]*\.?\b", re.IGNORECASE)
@@ -161,7 +166,7 @@ def reperer_colonnes_jours(page, date_ref: datetime) -> list[dict]:
     for entete in candidats_entetes:
         txt = entete.inner_text().strip()
         if len(txt) <= 30 and not re.search(r"\d{1,2}[h:]\d{2}", txt):
-            date_col = extraire_date_depuis_texte(txt, date_ref)
+            date_col = extraire_date_depuis_texte(txt, maintenant)
             box = entete.bounding_box()
             if date_col and box and box["width"] > 30:
                 colonnes_jours.append({
@@ -172,9 +177,53 @@ def reperer_colonnes_jours(page, date_ref: datetime) -> list[dict]:
     return colonnes_jours
 
 
-def extraire_cours_visibles(page, date_ref: datetime) -> tuple[list[dict], str]:
-    colonnes_jours = reperer_colonnes_jours(page, date_ref)
-    signature_semaine = "|".join(sorted(c["label"] for c in colonnes_jours))
+def signature_semaine(colonnes_jours: list[dict]) -> str:
+    return "|".join(sorted(c["label"] for c in colonnes_jours))
+
+
+def attendre_changement_semaine(page, signature_avant: str, maintenant: datetime, timeout_ms: int = 3000) -> bool:
+    """Attend dynamiquement que les en-têtes de colonnes changent après un clic de navigation."""
+    pas_ms = 200
+    for _ in range(timeout_ms // pas_ms):
+        page.wait_for_timeout(pas_ms)
+        cols = reperer_colonnes_jours(page, maintenant)
+        sig = signature_semaine(cols)
+        if sig and sig != signature_avant:
+            page.wait_for_timeout(250)
+            return True
+    return False
+
+
+def formater_lieu(infos_cours: list[str]) -> str:
+    """Extrait proprement les numéros de salle (ex. 250, 229 INFO) et l'adresse sans doublon."""
+    salles = []
+    adresse = ""
+
+    for ligne in infos_cours[1:]:
+        if re.search(r"\b(rue|avenue|boulevard|allée|place|impasse|jean parot)\b", ligne, re.I):
+            adresse = ligne
+            continue
+        # Ignore les codes de groupe (2GX-CMTD1, 2GM-TP4...) et les types de séance (CM, TD, TP...)
+        if re.match(r"^\d+[A-Z]{2,}-", ligne, re.I) or re.match(r"^(CM|TD|TP|CMTD|DS)\b", ligne, re.I):
+            continue
+        if re.match(
+            r"^(?:salle\s+|amphi\s+|labo\s+|atelier\s+|gymnase\s+|halle\s+)?(?:\d{2,4}(?:\s+[A-Z0-9-]+)?|[A-Z]\d{2,3}|amphi\s*\w+|gymnase\w*|halle\w*)$",
+            ligne,
+            re.I,
+        ):
+            salles.append(ligne)
+
+    texte_salle = ""
+    if salles:
+        prefixe = "Salle " if re.match(r"^\d", salles[0]) else ""
+        texte_salle = f"{prefixe}{', '.join(salles)}"
+
+    return " - ".join(part for part in (texte_salle, adresse) if part)
+
+
+def extraire_cours_visibles(page, maintenant: datetime) -> tuple[list[dict], str]:
+    colonnes_jours = reperer_colonnes_jours(page, maintenant)
+    sig = signature_semaine(colonnes_jours)
 
     selecteurs_possibles = [
         ".EmploiDuTemps_Element",
@@ -218,7 +267,7 @@ def extraire_cours_visibles(page, date_ref: datetime) -> tuple[list[dict], str]:
                     date_cours = col_proche["date"]
 
             if not date_cours:
-                date_cours = extraire_date_depuis_texte(aria or texte, date_ref)
+                date_cours = extraire_date_depuis_texte(aria or texte, maintenant)
 
             if not date_cours:
                 continue
@@ -229,16 +278,7 @@ def extraire_cours_visibles(page, date_ref: datetime) -> tuple[list[dict], str]:
                 if not re.search(r"^\d{1,2}[h:]\d{2}\s*(?:-|–|—|à)\s*\d{1,2}[h:]\d{2}$", l)
             ]
             titre = infos_cours[0] if infos_cours else "Cours ENISE"
-
-            salle = next(
-                (l for l in infos_cours[1:] if re.search(r"^\d{2,4}\s+[A-Z]|salle|amphi|labo|atelier|^[A-Z]\d+", l, re.I)),
-                "",
-            )
-            adresse = next(
-                (l for l in infos_cours[1:] if re.search(r"\b(rue|avenue|boulevard|allée|place|impasse)\b", l, re.I)),
-                "",
-            )
-            lieu = " - ".join(part for part in (salle, adresse) if part)
+            lieu = formater_lieu(infos_cours)
 
             evenements.append({
                 "dtstart": date_cours.replace(hour=h1, minute=min1),
@@ -251,32 +291,65 @@ def extraire_cours_visibles(page, date_ref: datetime) -> tuple[list[dict], str]:
         if evenements:
             break
 
-    return evenements, signature_semaine
+    return evenements, sig
 
 
-def passer_semaine_suivante(page, signature_avant: str) -> bool:
-    """Clique sur le bouton semaine suivante d'Hyperplanning et vérifie que la grille a changé."""
-    candidats_boutons = [
-        page.locator("[title*='suivante' i]:visible, [aria-label*='suivante' i]:visible").first,
-        page.locator("[class*='fleche_droite']:visible, [class*='droite']:visible, [class*='next']:visible, [class*='suivant']:visible").first,
-        # Bandeau de semaines Hyperplanning : pastille suivant immédiatement la semaine sélectionnée
-        page.locator(
-            "[class*='Calendrier_Jour_Selection']:visible, [class*='semaine'][class*='actif']:visible, [aria-selected='true']:visible"
-        ).first.locator("xpath=following-sibling::*[1]"),
-    ]
+def cliquer_fleche_semaine(page, direction: str, signature_avant: str, maintenant: datetime) -> bool:
+    """Navigue d'une semaine ('suivante' ou 'precedente') et vérifie le rafraîchissement de la grille."""
+    if direction == "suivante":
+        candidats = [
+            page.locator("[title*='suivante' i]:visible, [aria-label*='suivante' i]:visible").first,
+            page.locator("[class*='fleche_droite']:visible, [class*='droite']:visible, [class*='next']:visible, [class*='suivant']:visible").first,
+            page.locator(
+                "[class*='Calendrier_Jour_Selection']:visible, [class*='semaine'][class*='actif']:visible, [aria-selected='true']:visible"
+            ).first.locator("xpath=following-sibling::*[1]"),
+        ]
+    else:
+        candidats = [
+            page.locator("[title*='précédente' i]:visible, [title*='precedente' i]:visible, [aria-label*='précédente' i]:visible").first,
+            page.locator("[class*='fleche_gauche']:visible, [class*='gauche']:visible, [class*='prev']:visible, [class*='precedent']:visible").first,
+            page.locator(
+                "[class*='Calendrier_Jour_Selection']:visible, [class*='semaine'][class*='actif']:visible, [aria-selected='true']:visible"
+            ).first.locator("xpath=preceding-sibling::*[1]"),
+        ]
 
-    for btn in candidats_boutons:
+    for btn in candidats:
         try:
             if btn.count() > 0:
-                btn.click(timeout=3000)
-                page.wait_for_timeout(2500)
-                _, signature_apres = extraire_cours_visibles(page, datetime.now())
-                if signature_apres and signature_apres != signature_avant:
+                btn.click(timeout=2000)
+                if attendre_changement_semaine(page, signature_avant, maintenant):
                     return True
         except Exception:
             continue
 
     return False
+
+
+def aller_debut_annee(page, maintenant: datetime):
+    """Revient à la première semaine de l'année universitaire (septembre) avant le balayage complet."""
+    print("Retour au début de l'année universitaire...")
+    # 1. Tentative de clic direct sur la première pastille de semaine dans le bandeau supérieur
+    pastilles_semaines = page.locator(
+        "[class*='Calendrier_Jour']:visible, [class*='Calendrier'] td:visible, [class*='Calendrier'] div[role='button']:visible"
+    ).all()
+    for p in pastilles_semaines:
+        txt = p.inner_text().strip()
+        box = p.bounding_box()
+        if re.fullmatch(r"\d{1,2}", txt) and box and box["y"] < 260:
+            sig_avant = signature_semaine(reperer_colonnes_jours(page, maintenant))
+            try:
+                p.click(timeout=2000)
+                if attendre_changement_semaine(page, sig_avant, maintenant):
+                    return
+            except Exception:
+                pass
+            break
+
+    # 2. Repli : recul semaine par semaine jusqu'au début disponible
+    for _ in range(25):
+        sig_avant = signature_semaine(reperer_colonnes_jours(page, maintenant))
+        if not cliquer_fleche_semaine(page, "precedente", sig_avant, maintenant):
+            break
 
 
 def recuperer_edt():
@@ -315,15 +388,17 @@ def recuperer_edt():
         else:
             search_input.press("Enter")
 
-        page.wait_for_timeout(4000)
-
+        page.wait_for_timeout(3500)
         maintenant = datetime.now()
+
+        if DEPUIS_DEBUT_ANNEE:
+            aller_debut_annee(page, maintenant)
+
         evenements_uniques = []
         cles_vues = set()
 
-        for idx_semaine in range(NB_SEMAINES):
-            date_ref = maintenant + timedelta(weeks=idx_semaine)
-            cours_semaine, signature = extraire_cours_visibles(page, date_ref)
+        for idx_semaine in range(MAX_SEMAINES):
+            cours_semaine, sig = extraire_cours_visibles(page, maintenant)
 
             ajoutes_semaine = 0
             for ev in cours_semaine:
@@ -333,12 +408,11 @@ def recuperer_edt():
                     evenements_uniques.append(ev)
                     ajoutes_semaine += 1
 
-            print(f"Semaine {idx_semaine + 1}/{NB_SEMAINES} : {ajoutes_semaine} cours récupérés.")
+            print(f"Semaine {idx_semaine + 1} ({sig.split('|')[0] if sig else '?'}) : {ajoutes_semaine} cours.")
 
-            if idx_semaine < NB_SEMAINES - 1:
-                if not passer_semaine_suivante(page, signature):
-                    print("Impossible de passer à la semaine suivante, arrêt de la boucle.")
-                    break
+            if not cliquer_fleche_semaine(page, "suivante", sig, maintenant):
+                print("Fin de l'année universitaire atteinte.")
+                break
 
         browser.close()
 
