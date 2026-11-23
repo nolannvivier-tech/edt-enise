@@ -154,21 +154,42 @@ def extraire_date_depuis_texte(texte: str, maintenant: datetime) -> datetime | N
 
 
 def reperer_colonnes_jours(page, maintenant: datetime) -> list[dict]:
-    colonnes_jours = []
-    candidats_entetes = page.locator("th:visible, div:visible, span:visible, td:visible").filter(
-        has_text=re.compile(r"\b(lun|mar|mer|jeu|ven|sam)[a-z]*\.?\b", re.IGNORECASE)
-    ).all()
+    """Capture atomiquement les en-têtes des jours pour éviter toute erreur si le DOM se rafraîchit."""
+    try:
+        bruts = page.evaluate(r"""() => {
+            const res = [];
+            const regex = /\b(lun|mar|mer|jeu|ven|sam)[a-z]*\.?\b/i;
+            const els = document.querySelectorAll('th, div, span, td');
+            for (const el of els) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 30 || rect.height <= 0) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                const txt = (el.innerText || '').trim();
+                if (txt.length > 0 && txt.length <= 30 && regex.test(txt) && !/\d{1,2}[h:]\d{2}/.test(txt)) {
+                    res.push({
+                        txt: txt,
+                        x_centre: rect.x + rect.width / 2
+                    });
+                }
+            }
+            return res;
+        }""")
+    except Exception:
+        return []
 
-    for entete in candidats_entetes:
-        txt = entete.inner_text().strip()
-        if len(txt) <= 30 and not re.search(r"\d{1,2}[h:]\d{2}", txt):
-            date_col = extraire_date_depuis_texte(txt, maintenant)
-            box = entete.bounding_box()
-            if date_col and box and box["width"] > 30:
+    colonnes_jours = []
+    deja_vus = set()
+    for item in bruts:
+        date_col = extraire_date_depuis_texte(item["txt"], maintenant)
+        if date_col:
+            cle = (date_col, round(item["x_centre"] / 15))
+            if cle not in deja_vus:
+                deja_vus.add(cle)
                 colonnes_jours.append({
-                    "x_centre": box["x"] + box["width"] / 2,
+                    "x_centre": item["x_centre"],
                     "date": date_col,
-                    "label": txt,
+                    "label": item["txt"],
                 })
     colonnes_jours.sort(key=lambda c: c["x_centre"])
     return colonnes_jours
@@ -178,7 +199,7 @@ def signature_semaine(colonnes_jours: list[dict]) -> str:
     return "|".join(c["label"] for c in colonnes_jours)
 
 
-def attendre_changement_semaine(page, signature_avant: str, maintenant: datetime, timeout_ms: int = 1800) -> bool:
+def attendre_changement_semaine(page, signature_avant: str, maintenant: datetime, timeout_ms: int = 2500) -> bool:
     pas_ms = 150
     for _ in range(timeout_ms // pas_ms):
         page.wait_for_timeout(pas_ms)
@@ -219,98 +240,113 @@ def extraire_cours_visibles(page, maintenant: datetime) -> tuple[list[dict], str
     colonnes_jours = reperer_colonnes_jours(page, maintenant)
     sig = signature_semaine(colonnes_jours)
 
-    selecteurs_possibles = [
-        ".EmploiDuTemps_Element",
-        ".fc-event",
-        ".event",
-        ".cours",
-        "[class*='event']",
-        "[class*='cours']",
-        "[class*='slot']",
-    ]
+    try:
+        donnees_cours = page.evaluate(r"""() => {
+            const selecteurs = [
+                '.EmploiDuTemps_Element',
+                '.fc-event',
+                '.event',
+                '.cours',
+                "[class*='event']",
+                "[class*='cours']",
+                "[class*='slot']"
+            ];
+            for (const sel of selecteurs) {
+                const els = Array.from(document.querySelectorAll(sel));
+                if (els.length === 0) continue;
+                const items = [];
+                for (const el of els) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) continue;
+                    const texte = (el.innerText || '').trim();
+                    if (!texte) continue;
+                    const aria = el.getAttribute('aria-label') || el.getAttribute('title') || '';
+                    items.push({
+                        texte: texte,
+                        aria: aria,
+                        x_centre: rect.x + rect.width / 2
+                    });
+                }
+                if (items.length > 0) return items;
+            }
+            return [];
+        }""")
+    except Exception:
+        return [], sig
 
     evenements = []
 
-    for sel in selecteurs_possibles:
-        elements = page.locator(sel).all()
-        if not elements:
+    for item in donnees_cours:
+        texte = item["texte"]
+        aria = item["aria"]
+        source_complete = f"{aria} | {texte}".strip(" |")
+
+        m_heure = re.search(
+            r"(?:de\s+)?(\d{1,2})[h:](\d{2})\s*(?:-|–|—|à|/)\s*(\d{1,2})[h:](\d{2})",
+            source_complete,
+        )
+        if not m_heure:
             continue
 
-        for el in elements:
-            texte = el.inner_text().strip()
-            aria = el.get_attribute("aria-label") or el.get_attribute("title") or ""
-            source_complete = f"{aria} | {texte}".strip(" |")
-            if not texte:
-                continue
+        h1, min1, h2, min2 = map(int, m_heure.groups())
 
-            m_heure = re.search(
-                r"(?:de\s+)?(\d{1,2})[h:](\d{2})\s*(?:-|–|—|à|/)\s*(\d{1,2})[h:](\d{2})",
-                source_complete,
-            )
-            if not m_heure:
-                continue
+        date_cours = None
+        if colonnes_jours:
+            col_proche = min(colonnes_jours, key=lambda c: abs(c["x_centre"] - item["x_centre"]))
+            date_cours = col_proche["date"]
 
-            h1, min1, h2, min2 = map(int, m_heure.groups())
+        if not date_cours:
+            date_cours = extraire_date_depuis_texte(aria or texte, maintenant)
 
-            date_cours = None
-            if colonnes_jours:
-                box = el.bounding_box()
-                if box:
-                    x_cours = box["x"] + box["width"] / 2
-                    col_proche = min(colonnes_jours, key=lambda c: abs(c["x_centre"] - x_cours))
-                    date_cours = col_proche["date"]
+        if not date_cours:
+            continue
 
-            if not date_cours:
-                date_cours = extraire_date_depuis_texte(aria or texte, maintenant)
+        lignes_texte = [l.strip() for l in texte.splitlines() if l.strip()]
+        infos_cours = [
+            l for l in lignes_texte
+            if not re.search(r"^\d{1,2}[h:]\d{2}\s*(?:-|–|—|à)\s*\d{1,2}[h:]\d{2}$", l)
+        ]
+        titre = infos_cours[0] if infos_cours else "Cours ENISE"
+        lieu = formater_lieu(infos_cours)
 
-            if not date_cours:
-                continue
-
-            lignes_texte = [l.strip() for l in texte.splitlines() if l.strip()]
-            infos_cours = [
-                l for l in lignes_texte
-                if not re.search(r"^\d{1,2}[h:]\d{2}\s*(?:-|–|—|à)\s*\d{1,2}[h:]\d{2}$", l)
-            ]
-            titre = infos_cours[0] if infos_cours else "Cours ENISE"
-            lieu = formater_lieu(infos_cours)
-
-            evenements.append({
-                "dtstart": date_cours.replace(hour=h1, minute=min1),
-                "dtend": date_cours.replace(hour=h2, minute=min2),
-                "summary": titre,
-                "location": lieu,
-                "description": " | ".join(lignes_texte),
-            })
-
-        if evenements:
-            break
+        evenements.append({
+            "dtstart": date_cours.replace(hour=h1, minute=min1),
+            "dtend": date_cours.replace(hour=h2, minute=min2),
+            "summary": titre,
+            "location": lieu,
+            "description": " | ".join(lignes_texte),
+        })
 
     return evenements, sig
 
 
 def trouver_barre_semaines(page) -> tuple[list[dict], float | None]:
     """Repère la ligne horizontale unique contenant les pastilles de semaines (1..53)."""
-    candidats = page.locator("div:visible, td:visible, span:visible, li:visible, a:visible, button:visible").all()
-    items = []
-    for el in candidats:
-        try:
-            txt = el.inner_text().strip()
-            if not re.fullmatch(r"\d{1,2}", txt):
-                continue
-            num = int(txt)
-            if not (1 <= num <= 53):
-                continue
-            box = el.bounding_box()
-            if not box or box["y"] > 300 or box["width"] > 80 or box["height"] > 60:
-                continue
-            items.append({
-                "el": el,
-                "num": num,
-                "x": box["x"] + box["width"] / 2,
-                "y": box["y"] + box["height"] / 2,
-            })
-        except Exception:
-            continue
+    try:
+        items = page.evaluate(r"""() => {
+            const res = [];
+            const els = document.querySelectorAll('div, td, span, li, a, button');
+            for (const el of els) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0 || rect.y > 300 || rect.width > 80 || rect.height > 60) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                const txt = (el.innerText || '').trim();
+                if (/^\d{1,2}$/.test(txt)) {
+                    const num = parseInt(txt, 10);
+                    if (num >= 1 && num <= 53) {
+                        res.push({
+                            num: num,
+                            x: rect.x + rect.width / 2,
+                            y: rect.y + rect.height / 2
+                        });
+                    }
+                }
+            }
+            return res;
+        }""")
+    except Exception:
+        return [], None
 
     if not items:
         return [], None
@@ -335,33 +371,33 @@ def trouver_barre_semaines(page) -> tuple[list[dict], float | None]:
 
 def cliquer_fleche_barre(page, y_barre: float, cote: str, x_limite: float) -> bool:
     """Clique sur la flèche de défilement gauche ou droite située sur l'axe Y de la barre des semaines."""
-    candidats = page.locator("div:visible, td:visible, span:visible, button:visible, i:visible, a:visible").all()
-    meilleur = None
-    for el in candidats:
-        try:
-            box = el.bounding_box()
-            if not box or box["width"] > 60 or box["height"] > 60:
-                continue
-            yc = box["y"] + box["height"] / 2
-            xc = box["x"] + box["width"] / 2
-            if abs(yc - y_barre) > 15:
-                continue
-            if cote == "gauche" and xc < x_limite - 5:
-                if meilleur is None or xc > meilleur[0]:
-                    meilleur = (xc, el)
-            elif cote == "droite" and xc > x_limite + 5:
-                if meilleur is None or xc < meilleur[0]:
-                    meilleur = (xc, el)
-        except Exception:
-            continue
+    try:
+        cible = page.evaluate(r"""({ yBarre, cote, xLimite }) => {
+            const els = document.querySelectorAll('div, td, span, button, i, a');
+            let meilleur = null;
+            for (const el of els) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0 || rect.width > 60 || rect.height > 60) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                const yc = rect.y + rect.height / 2;
+                const xc = rect.x + rect.width / 2;
+                if (Math.abs(yc - yBarre) > 15) continue;
+                if (cote === 'gauche' && xc < xLimite - 5) {
+                    if (!meilleur || xc > meilleur.x) meilleur = { x: xc, y: yc };
+                } else if (cote === 'droite' && xc > xLimite + 5) {
+                    if (!meilleur || xc < meilleur.x) meilleur = { x: xc, y: yc };
+                }
+            }
+            return meilleur;
+        }""", {"yBarre": y_barre, "cote": cote, "xLimite": x_limite})
+    except Exception:
+        return False
 
-    if meilleur:
-        try:
-            meilleur[1].click(timeout=1500)
-            page.wait_for_timeout(400)
-            return True
-        except Exception:
-            return False
+    if cible:
+        page.mouse.click(cible["x"], cible["y"])
+        page.wait_for_timeout(400)
+        return True
     return False
 
 
@@ -413,7 +449,6 @@ def recuperer_edt():
 
         if bande and y_barre is not None:
             if DEPUIS_DEBUT_ANNEE:
-                # Défile tout à gauche jusqu'à septembre puis sélectionne la première semaine
                 for _ in range(10):
                     premier_avant = bande[0]["num"]
                     if not cliquer_fleche_barre(page, y_barre, "gauche", bande[0]["x"]):
@@ -423,7 +458,7 @@ def recuperer_edt():
                         break
 
                 sig_avant = signature_semaine(reperer_colonnes_jours(page, maintenant))
-                bande[0]["el"].click(timeout=2000)
+                page.mouse.click(bande[0]["x"], bande[0]["y"])
                 attendre_changement_semaine(page, sig_avant, maintenant)
                 semaines_traitees.add(bande[0]["num"])
             else:
@@ -462,10 +497,9 @@ def recuperer_edt():
                     break
 
                 semaines_traitees.add(prochaine["num"])
-                prochaine["el"].click(timeout=2000)
+                page.mouse.click(prochaine["x"], prochaine["y"])
                 attendre_changement_semaine(page, sig, maintenant)
         else:
-            # Repli de sécurité : extrait au minimum la semaine courante affichée
             cours_semaine, _ = extraire_cours_visibles(page, maintenant)
             evenements_uniques.extend(cours_semaine)
 
